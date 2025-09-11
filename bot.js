@@ -147,7 +147,7 @@ async function getAISummary(articleUrl) {
 Пиши от первого лица, как владелец канала.
 `;
 
-  try {
+try {
     const completion = await openai.chat.completions.create({
       model: "deepseek/deepseek-chat-v3.1:free",
       messages: [{ 
@@ -160,6 +160,11 @@ async function getAISummary(articleUrl) {
     
     return completion.choices[0].message.content;
   } catch (error) {
+    if (error.status === 429) {
+      console.log('⚠️ Достигнут лимит запросов. Ждем 1 минуту...');
+      await new Promise(resolve => setTimeout(resolve, 60000)); // Ждем 1 минуту
+      return null;
+    }
     console.error('OpenRouter API Error:', error);
     return null;
   }
@@ -228,3 +233,42 @@ async function checkBestStories() {
     console.error('Ошибка при проверке лучших новостей:', error);
   }
 }
+
+// Запускаем проверку лучших новостей каждые 30 минут
+const checkInterval = 30 * 60 * 1000; // 30 минут
+let intervalId = setInterval(checkBestStories, checkInterval);
+
+console.log('🤖 Бот запущен! Проверка новостей каждые 30 минут.');
+
+// Базовые команды бота
+bot.command("start", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  await ctx.reply("🤖 Бот запущен и автоматически проверяет лучшие новости на Hacker News каждые 30 минут. Используйте /help для просмотра всех команд.");
+});
+
+bot.command("force_check", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  await ctx.reply("Принудительная проверка лучших новостей...");
+  await checkBestStories();
+  await ctx.reply("Проверка завершена!");
+});
+
+bot.command("stop", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  clearInterval(intervalId);
+  await ctx.reply("🛑 Автоматическая проверка новостей остановлена.");
+});
+
+bot.command("start_auto", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  intervalId = setInterval(checkBestStories, checkInterval);
+  await ctx.reply("✅ Автоматическая проверка новостей запущена.");
+});
+
+bot.start().then(() => {
+  console.log('🤖 Бот запущен!');
+});
+
+bot.catch((err) => {
+  console.error('Ошибка бота:', err);
+});
