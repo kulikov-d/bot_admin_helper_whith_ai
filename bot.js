@@ -246,19 +246,16 @@ async function checkBestStories() {
 const checkInterval = 30 * 60 * 1000; // 30 минут
 let intervalId = setInterval(checkBestStories, checkInterval);
 
-// Также запускаем сразу при старте
-checkBestStories();
+console.log('🤖 Бот запущен! Проверка новостей каждые 30 минут.');
 
 // Базовые команды бота
 bot.command("start", async (ctx) => {
   if (!isOwner(ctx)) return;
-  
   await ctx.reply("🤖 Бот запущен и автоматически проверяет лучшие новости на Hacker News каждые 30 минут. Используйте /help для просмотра всех команд.");
 });
 
 bot.command("force_check", async (ctx) => {
   if (!isOwner(ctx)) return;
-  
   await ctx.reply("Принудительная проверка лучших новостей...");
   await checkBestStories();
   await ctx.reply("Проверка завершена!");
@@ -266,14 +263,12 @@ bot.command("force_check", async (ctx) => {
 
 bot.command("stop", async (ctx) => {
   if (!isOwner(ctx)) return;
-  
   clearInterval(intervalId);
   await ctx.reply("🛑 Автоматическая проверка новостей остановлена.");
 });
 
 bot.command("start_auto", async (ctx) => {
   if (!isOwner(ctx)) return;
-  
   intervalId = setInterval(checkBestStories, checkInterval);
   await ctx.reply("✅ Автоматическая проверка новостей запущена.");
 });
