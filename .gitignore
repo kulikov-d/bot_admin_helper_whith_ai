@@ -1,0 +1,5 @@
+node_modules/
+.env
+hn_bot.db
+.DS_Store
+*.log
