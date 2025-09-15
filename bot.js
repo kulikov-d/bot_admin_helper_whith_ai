@@ -1,30 +1,24 @@
 require('dotenv').config();
 const { Bot } = require("grammy");
-const { OpenAI } = require("openai");
-const sqlite3 = require('sqlite3').verbose();
-const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+const os = require('os');
+const { exec } = require('child_process');
 
-const bot = new Bot(process.env.BOT_TOKEN);
-const CHANNEL_ID = process.env.CHANNEL_ID;
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const OWNER_ID = process.env.OWNER_ID;
+// Импортируем наши модули
+const config = require('./config');
+const Database = require('./database');
+const { checkBestStories } = require('./hnChecker');
+const { checkNewJobs } = require('./jobChecker');
+const { getCpuTemperature } = require('./utils');
 
-// Ограничиваем количество обрабатываемых новостей за один раз
-const MAX_STORIES_PER_RUN = 3;
+const bot = new Bot(config.BOT_TOKEN);
+const db = new Database();
 
-// Инициализируем OpenAI клиент для OpenRouter
-const openai = new OpenAI({
-  baseURL: "https://openrouter.ai/api/v1",
-  apiKey: OPENROUTER_API_KEY,
-  defaultHeaders: {
-    "HTTP-Referer": "https://your-telegram-bot.com",
-    "X-Title": "Hacker News Digest Bot"
-  }
-});
+let currentKeyIndex = 0;
+let intervalId, jobIntervalId;
 
 // Функция проверки прав доступа
 function isOwner(ctx) {
-  return ctx.from && ctx.from.id === parseInt(OWNER_ID);
+  return ctx.from && ctx.from.id === parseInt(config.OWNER_ID);
 }
 
 // Middleware для проверки прав доступа
@@ -36,40 +30,27 @@ bot.use(async (ctx, next) => {
   await next();
 });
 
-// Подключаемся к базе данных SQLite
-let db = new sqlite3.Database('./hn_bot.db', (err) => {
-  if (err) {
-    console.error('Ошибка подключения к БД:', err);
-  } else {
-    console.log('Подключен к SQLite DB.');
-    // Создаем таблицу для отслеживания уже отправленных новостей
-    db.run(`CREATE TABLE IF NOT EXISTS posted_stories (
-      id INTEGER PRIMARY KEY,
-      story_id INTEGER NOT NULL UNIQUE,
-      title TEXT,
-      processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`, (err) => {
-      if (err) {
-        console.error('Ошибка при создании таблицы:', err);
-      } else {
-        console.log('Таблица posted_stories создана/проверена');
-      }
-    });
-  }
-});
-
 // Команда для очистки базы данных
 bot.command("clear_db", async (ctx) => {
   if (!isOwner(ctx)) return;
   
   try {
-    db.run("DELETE FROM posted_stories", function(err) {
+    db.db.run("DELETE FROM posted_stories", function(err) {
       if (err) {
-        console.error('Ошибка при очистке БД:', err);
-        ctx.reply("❌ Ошибка при очистке базы данных");
+        console.error('Ошибка при очистке БД новостей:', err);
+        ctx.reply("❌ Ошибка при очистке базы данных новостей");
       } else {
-        console.log('База данных очищена. Удалено записей:', this.changes);
-        ctx.reply("✅ База данных успешно очищена! Все новости будут обработаны заново.");
+        console.log('База данных новостей очищена. Удалено записей:', this.changes);
+        ctx.reply(`✅ База данных новостей успешно очищена! Удалено записей: ${this.changes}`);
+      }
+    });
+    
+    db.db.run("DELETE FROM posted_jobs", function(err) {
+      if (err) {
+        console.error('Ошибка при очистке БД вакансий:', err);
+      } else {
+        console.log('База данных вакансий очищена. Удалено записей:', this.changes);
+        ctx.reply(`✅ База данных вакансий успешно очищена! Удалено записей: ${this.changes}`);
       }
     });
   } catch (error) {
@@ -87,186 +68,175 @@ bot.command("help", async (ctx) => {
 
 /start - Запустить бота и показать информацию
 /help - Показать это сообщение со списком команд
-/force_check - Принудительно проверить новые новости
-/clear_db - Очистить базу данных (удалить историю обработанных новостей)
-/stop - Остановить автоматическую проверку новостей
-/start_auto - Запустить автоматическую проверку новостей
-
-Бот автоматически проверяет лучшие новости с Hacker News каждые 30 минут и публикует их в канал.
+/force_check - Принудительно проверить новые новости (макс. 3)
+/force_jobs - Принудительно проверить новые вакансии (макс. 3)
+/clear_db - Очистить базу данных (удалить историю обработанных новостей и вакансий)
+/stop - Остановить автоматическую проверку новостей и вакансий
+/start_auto - Запустить автоматическую проверку новостей и вакансий
+/stats - Показать статистику публикаций за сегодня
+/server - Показать информацию о состоянии сервера
   `;
   
   await ctx.reply(helpText);
 });
 
-// Функция для проверки, была ли новость уже отправлена
-function isStoryPosted(storyId) {
-  return new Promise((resolve, reject) => {
-    db.get("SELECT story_id FROM posted_stories WHERE story_id = ?", [storyId], (err, row) => {
-      if (err) reject(err);
-      resolve(!!row);
-    });
-  });
-}
-
-// Функция для отметки новости как отправленной
-function markStoryAsPosted(storyId, title) {
-  return new Promise((resolve, reject) => {
-    db.run("INSERT INTO posted_stories (story_id, title) VALUES (?, ?)", [storyId, title], function(err) {
-      if (err) {
-        console.error('Ошибка при сохранении новости в БД:', err);
-        reject(err);
-      } else {
-        console.log(`Новость #${storyId} сохранена в БД`);
-        resolve();
-      }
-    });
-  });
-}
-
-// Функция для запроса к OpenRouter API
-async function getAISummary(articleUrl) {
-  const prompt = `
-Проанализируй статью по ссылке: ${articleUrl}
-
-Создай информативную выжимку на русском языке (примерно 350 слов) для IT-канала в Telegram.
-
-Ключевые требования:
-1. Стиль: неформальный, экспертный, прямой — как будто это пост администратора канала
-2. Начинай сразу с сути, без вступлений и приветствий
-3. Выдели главную идею и 2-3 самых важных момента из статьи
-4. Добавь практические выводы или инсайты
-5. Избегай маркдауна (*, _ и другого форматирования)
-6. Не упоминай, что это анализ или выжимка — подавай как оригинальный контент
-
-
-Формат:
-- Яркий заголовок
-- Основной текст с ключевыми тезисами
-- Практический вывод
-
-Пиши от первого лица, как владелец канала.
-`;
-
-try {
-    const completion = await openai.chat.completions.create({
-      model: "deepseek/deepseek-chat-v3.1:free",
-      messages: [{ 
-        role: "user", 
-        content: prompt 
-      }],
-      temperature: 0.7,
-      max_tokens: 1000
-    });
-    
-    return completion.choices[0].message.content;
-  } catch (error) {
-    if (error.status === 429) {
-      console.log('⚠️ Достигнут лимит запросов. Ждем 1 минуту...');
-      await new Promise(resolve => setTimeout(resolve, 60000)); // Ждем 1 минуту
-      return null;
-    }
-    console.error('OpenRouter API Error:', error);
-    return null;
-  }
-}
-
-// Функция для проверки лучших новостей
-async function checkBestStories() {
-  try {
-    console.log('Проверяем лучшие новости...');
-    
-    const bestStoriesResponse = await fetch('https://hacker-news.firebaseio.com/v0/beststories.json');
-    const bestStoriesIds = await bestStoriesResponse.json();
-    
-    const topStoriesIds = bestStoriesIds.slice(0, 30);
-    let newStoriesCount = 0;
-    
-    for (const storyId of topStoriesIds) {
-      if (newStoriesCount >= MAX_STORIES_PER_RUN) {
-        console.log(`Достигнут лимит в ${MAX_STORIES_PER_RUN} новости за один запуск`);
-        break;
-      }
-      
-      try {
-        const alreadyPosted = await isStoryPosted(storyId);
-        if (alreadyPosted) {
-          console.log(`Новость #${storyId} уже была обработана, пропускаем`);
-          continue;
-        }
-        
-        const storyResponse = await fetch(`https://hacker-news.firebaseio.com/v0/item/${storyId}.json`);
-        const story = await storyResponse.json();
-        
-        if (story && story.type === 'story' && story.url && story.title) {
-          console.log(`Обрабатываем новую лучшую новость #${storyId}: ${story.title}`);
-          
-          const aiSummary = await getAISummary(story.url);
-          
-          if (aiSummary) {
-            const domain = new URL(story.url).hostname.replace('www.', '');
-            const message = `📰 *${story.title}*\n\n${aiSummary}\n\n——\n[Подписаться на Hacker News](https://t.me/hackernewru)\n\n🔗 Источник: ${domain}\n💬 Обсуждение: https://news.ycombinator.com/item?id=${storyId}\n\n📝 Новости взяты с Hacker News и адаптированы для русскоязычной аудитории с сохранением оригинального смысла.`;
-            
-            await bot.api.sendMessage(CHANNEL_ID, message, {
-              parse_mode: "Markdown",
-              disable_web_page_preview: false
-            });
-            
-            console.log(`Новость #${storyId} отправлена в канал!`);
-            await markStoryAsPosted(storyId, story.title);
-            newStoriesCount++;
-            
-            // Увеличиваем паузу до 30 секунд между запросами
-            await new Promise(resolve => setTimeout(resolve, 30000));
-          }
-        }
-      } catch (error) {
-        console.error(`Ошибка при обработке новости #${storyId}:`, error);
-      }
-    }
-    
-    if (newStoriesCount > 0) {
-      console.log(`Обработано новых новостей: ${newStoriesCount}`);
-    } else {
-      console.log('Новых лучших новостей не найдено');
-    }
-  } catch (error) {
-    console.error('Ошибка при проверке лучших новостей:', error);
-  }
-}
-
 // Запускаем проверку лучших новостей каждые 30 минут
-const checkInterval = 30 * 60 * 1000; // 30 минут
-let intervalId = setInterval(checkBestStories, checkInterval);
+function startNewsChecker() {
+  intervalId = setInterval(() => {
+    checkBestStories(db, bot, config.CHANNEL_ID, config.OPENROUTER_API_KEYS, config.MAX_ITEMS_PER_RUN);
+  }, config.CHECK_INTERVAL);
+}
 
-console.log('🤖 Бот запущен! Проверка новостей каждые 30 минут.');
+// Запускаем проверку новых вакансий каждые 30 минут
+function startJobChecker() {
+  jobIntervalId = setInterval(() => {
+    checkNewJobs(db, bot, config.JOB_CHANNEL_ID, config.MAX_ITEMS_PER_RUN);
+  }, config.CHECK_INTERVAL);
+}
+
+console.log('🤖 Бот запущен! Проверка новостей и вакансий каждые 30 минут.');
 
 // Базовые команды бота
 bot.command("start", async (ctx) => {
   if (!isOwner(ctx)) return;
-  await ctx.reply("🤖 Бот запущен и автоматически проверяет лучшие новости на Hacker News каждые 30 минут. Используйте /help для просмотра всех команд.");
+  await ctx.reply("🤖 Бот запущен и автоматически проверяет лучшие новости на Hacker News и вакансии каждые 30 минут. Используйте /help для просмотра всех команд.");
 });
 
 bot.command("force_check", async (ctx) => {
   if (!isOwner(ctx)) return;
-  await ctx.reply("Принудительная проверка лучших новостей...");
-  await checkBestStories();
-  await ctx.reply("Проверка завершена!");
+  await ctx.reply("Принудительная проверка лучших новостей (макс. 3)...");
+  await checkBestStories(db, bot, config.CHANNEL_ID, config.OPENROUTER_API_KEYS, config.MAX_ITEMS_PER_RUN);
+  await ctx.reply("Проверка новостей завершена!");
+});
+
+bot.command("force_jobs", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  await ctx.reply("Принудительная проверка новых вакансий (макс. 3)...");
+  await checkNewJobs(db, bot, config.JOB_CHANNEL_ID, config.MAX_ITEMS_PER_RUN);
+  await ctx.reply("Проверка вакансий завершена!");
 });
 
 bot.command("stop", async (ctx) => {
   if (!isOwner(ctx)) return;
   clearInterval(intervalId);
-  await ctx.reply("🛑 Автоматическая проверка новостей остановлена.");
+  clearInterval(jobIntervalId);
+  await ctx.reply("🛑 Автоматическая проверка новостей и вакансий остановлена.");
 });
 
 bot.command("start_auto", async (ctx) => {
   if (!isOwner(ctx)) return;
-  intervalId = setInterval(checkBestStories, checkInterval);
-  await ctx.reply("✅ Автоматическая проверка новостей запущена.");
+  startNewsChecker();
+  startJobChecker();
+  await ctx.reply("✅ Автоматическая проверка новостей и вакансий запущена.");
+});
+
+bot.command("stats", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    
+    const stats = await new Promise((resolve, reject) => {
+      db.db.all(`
+        SELECT channel_id, posts_count 
+        FROM statistics 
+        WHERE date = ?
+      `, [today], (err, rows) => {
+        if (err) reject(err);
+        else resolve(rows);
+      });
+    });
+    
+    let statsText = "📊 Статистика за сегодня:\n\n";
+    
+    if (stats.length === 0) {
+      statsText += "Нет данных о публикациях за сегодня.";
+    } else {
+      for (const stat of stats) {
+        const channelName = stat.channel_id === config.CHANNEL_ID ? "Hacker News" : 
+                           (stat.channel_id === config.JOB_CHANNEL_ID ? "Вакансии" : stat.channel_id);
+        statsText += `• ${channelName}: ${stat.posts_count} публикаций\n`;
+      }
+    }
+    
+    await ctx.reply(statsText);
+  } catch (error) {
+    console.error('Ошибка при получении статистики:', error);
+    ctx.reply("❌ Произошла ошибка при получении статистики");
+  }
+});
+
+bot.command("server", async (ctx) => {
+  if (!isOwner(ctx)) return;
+  
+  try {
+    // Получаем информацию о CPU
+    const cpus = os.cpus();
+    const cpuLoad = cpus.map(cpu => {
+      const total = Object.values(cpu.times).reduce((acc, tv) => acc + tv, 0);
+      const usage = total - cpu.times.idle;
+      return Math.round(usage / total * 100);
+    });
+    
+    const avgCpuLoad = cpuLoad.reduce((acc, load) => acc + load, 0) / cpuLoad.length;
+    
+    // Получаем температуру CPU
+    const cpuTemp = await getCpuTemperature();
+    
+    // Получаем информацию о памяти
+    const totalMem = os.totalmem();
+    const freeMem = os.freemem();
+    const usedMem = totalMem - freeMem;
+    const memUsage = Math.round((usedMem / totalMem) * 100);
+    
+    // Получаем информацию о диске
+    const osType = os.type();
+    let diskUsage = "N/A";
+    
+    if (osType === 'Linux' || osType === 'Darwin') {
+      try {
+        const { execSync } = require('child_process');
+        const dfOutput = execSync('df -h /').toString().split('\n')[1];
+        diskUsage = dfOutput.split(/\s+/)[4];
+      } catch (e) {
+        console.error('Ошибка при получении информации о диске:', e);
+      }
+    }
+    
+    // Формируем сообщение
+    let serverInfo = "🖥️ Информация о сервере:\n\n";
+    serverInfo += `CPU: ${avgCpuLoad.toFixed(1)}% загрузка\n`;
+    if (cpuTemp !== 'N/A') {
+      serverInfo += `🌡 Температура CPU: ${cpuTemp}\n`;
+    }
+    serverInfo += `Память: ${memUsage}% использовано\n`;
+    serverInfo += `Диск: ${diskUsage}\n`;
+    serverInfo += `Платформа: ${os.platform()} ${os.arch()}\n`;
+    serverInfo += `Версия Node.js: ${process.version}\n\n`;
+    serverInfo += `Всего памяти: ${(totalMem / (1024 * 1024 * 1024)).toFixed(2)} ГБ\n`;
+    serverInfo += `Свободно памяти: ${(freeMem / (1024 * 1024 * 1024)).toFixed(2)} ГБ`;
+    
+    await ctx.reply(serverInfo);
+  } catch (error) {
+    console.error('Ошибка при получении информации о сервере:', error);
+    ctx.reply("❌ Произошла ошибка при получении информации о сервере");
+  }
 });
 
 bot.start().then(() => {
   console.log('🤖 Бот запущен!');
+  // Выполняем первую проверку при старте
+  setTimeout(() => {
+    checkBestStories(db, bot, config.CHANNEL_ID, config.OPENROUTER_API_KEYS, config.MAX_ITEMS_PER_RUN);
+  }, 5000);
+  
+  setTimeout(() => {
+    checkNewJobs(db, bot, config.JOB_CHANNEL_ID, config.MAX_ITEMS_PER_RUN);
+  }, 15000);
+  
+  // Запускаем автоматическую проверку
+  startNewsChecker();
+  startJobChecker();
 });
 
 bot.catch((err) => {
