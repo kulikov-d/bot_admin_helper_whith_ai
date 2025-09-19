@@ -14,7 +14,9 @@ const bot = new Bot(config.BOT_TOKEN);
 const db = new Database();
 
 let currentKeyIndex = 0;
-let intervalId, jobIntervalId;
+let newsCheckerInterval, jobCheckerInterval;
+let isNewsChecking = false;
+let isJobsChecking = false;
 
 // Функция проверки прав доступа
 function isOwner(ctx) {
@@ -82,15 +84,47 @@ bot.command("help", async (ctx) => {
 
 // Запускаем проверку лучших новостей каждые 30 минут
 function startNewsChecker() {
-  intervalId = setInterval(() => {
-    checkBestStories(db, bot, config.CHANNEL_ID, config.OPENROUTER_API_KEYS, config.MAX_ITEMS_PER_RUN);
+  if (newsCheckerInterval) {
+    clearInterval(newsCheckerInterval);
+  }
+  
+  newsCheckerInterval = setInterval(async () => {
+    if (isNewsChecking) {
+      console.log('Проверка новостей уже выполняется, пропускаем...');
+      return;
+    }
+    
+    isNewsChecking = true;
+    try {
+      await checkBestStories(db, bot, config.CHANNEL_ID, config.OPENROUTER_API_KEYS, config.MAX_ITEMS_PER_RUN);
+    } catch (error) {
+      console.error('Ошибка при проверке новостей:', error);
+    } finally {
+      isNewsChecking = false;
+    }
   }, config.CHECK_INTERVAL);
 }
 
 // Запускаем проверку новых вакансий каждые 30 минут
 function startJobChecker() {
-  jobIntervalId = setInterval(() => {
-    checkNewJobs(db, bot, config.JOB_CHANNEL_ID, config.MAX_ITEMS_PER_RUN);
+  if (jobCheckerInterval) {
+    clearInterval(jobCheckerInterval);
+  }
+  
+  jobCheckerInterval = setInterval(async () => {
+    if (isJobsChecking) {
+      console.log('Проверка вакансий уже выполняется, пропускаем...');
+      return;
+    }
+    
+    isJobsChecking = true;
+    try {
+      await checkNewJobs(db, bot, config.JOB_CHANNEL_ID, config.MAX_ITEMS_PER_RUN);
+    } catch (error) {
+      console.error('Ошибка при проверке вакансий:', error);
+    } finally {
+      isJobsChecking = false;
+    }
   }, config.CHECK_INTERVAL);
 }
 
@@ -104,22 +138,50 @@ bot.command("start", async (ctx) => {
 
 bot.command("force_check", async (ctx) => {
   if (!isOwner(ctx)) return;
+  
+  if (isNewsChecking) {
+    return ctx.reply("⏳ Проверка новостей уже выполняется, подождите окончания.");
+  }
+  
   await ctx.reply("Принудительная проверка лучших новостей (макс. 3)...");
-  await checkBestStories(db, bot, config.CHANNEL_ID, config.OPENROUTER_API_KEYS, config.MAX_ITEMS_PER_RUN);
-  await ctx.reply("Проверка новостей завершена!");
+  isNewsChecking = true;
+  try {
+    await checkBestStories(db, bot, config.CHANNEL_ID, config.OPENROUTER_API_KEYS, config.MAX_ITEMS_PER_RUN);
+    await ctx.reply("Проверка новостей завершена!");
+  } catch (error) {
+    console.error('Ошибка при проверке новостей:', error);
+    await ctx.reply("❌ Произошла ошибка при проверке новостей");
+  } finally {
+    isNewsChecking = false;
+  }
 });
 
 bot.command("force_jobs", async (ctx) => {
   if (!isOwner(ctx)) return;
+  
+  if (isJobsChecking) {
+    return ctx.reply("⏳ Проверка вакансий уже выполняется, подождите окончания.");
+  }
+  
   await ctx.reply("Принудительная проверка новых вакансий (макс. 3)...");
-  await checkNewJobs(db, bot, config.JOB_CHANNEL_ID, config.MAX_ITEMS_PER_RUN);
-  await ctx.reply("Проверка вакансий завершена!");
+  isJobsChecking = true;
+  try {
+    await checkNewJobs(db, bot, config.JOB_CHANNEL_ID, config.MAX_ITEMS_PER_RUN);
+    await ctx.reply("Проверка вакансий завершена!");
+  } catch (error) {
+    console.error('Ошибка при проверке вакансий:', error);
+    await ctx.reply("❌ Произошла ошибка при проверке вакансий");
+  } finally {
+    isJobsChecking = false;
+  }
 });
 
 bot.command("stop", async (ctx) => {
   if (!isOwner(ctx)) return;
-  clearInterval(intervalId);
-  clearInterval(jobIntervalId);
+  clearInterval(newsCheckerInterval);
+  clearInterval(jobCheckerInterval);
+  newsCheckerInterval = null;
+  jobCheckerInterval = null;
   await ctx.reply("🛑 Автоматическая проверка новостей и вакансий остановлена.");
 });
 
@@ -180,41 +242,27 @@ bot.command("server", async (ctx) => {
     
     const avgCpuLoad = cpuLoad.reduce((acc, load) => acc + load, 0) / cpuLoad.length;
     
-    // Получаем температуру CPU
-    const cpuTemp = await getCpuTemperature();
-    
     // Получаем информацию о памяти
     const totalMem = os.totalmem();
     const freeMem = os.freemem();
     const usedMem = totalMem - freeMem;
     const memUsage = Math.round((usedMem / totalMem) * 100);
     
-    // Получаем информацию о диске
-    const osType = os.type();
-    let diskUsage = "N/A";
-    
-    if (osType === 'Linux' || osType === 'Darwin') {
-      try {
-        const { execSync } = require('child_process');
-        const dfOutput = execSync('df -h /').toString().split('\n')[1];
-        diskUsage = dfOutput.split(/\s+/)[4];
-      } catch (e) {
-        console.error('Ошибка при получении информации о диске:', e);
-      }
-    }
-    
     // Формируем сообщение
     let serverInfo = "🖥️ Информация о сервере:\n\n";
     serverInfo += `CPU: ${avgCpuLoad.toFixed(1)}% загрузка\n`;
-    if (cpuTemp !== 'N/A') {
-      serverInfo += `🌡 Температура CPU: ${cpuTemp}\n`;
+    
+    // Пытаемся получить температуру CPU
+    try {
+      const cpuTemp = await getCpuTemperature();
+      if (cpuTemp !== 'N/A') {
+        serverInfo += `🌡 Температура CPU: ${cpuTemp}\n`;
+      }
+    } catch (e) {
+      console.error('Не удалось получить температуру CPU:', e);
     }
+    
     serverInfo += `Память: ${memUsage}% использовано\n`;
-    serverInfo += `Диск: ${diskUsage}\n`;
-    serverInfo += `Платформа: ${os.platform()} ${os.arch()}\n`;
-    serverInfo += `Версия Node.js: ${process.version}\n\n`;
-    serverInfo += `Всего памяти: ${(totalMem / (1024 * 1024 * 1024)).toFixed(2)} ГБ\n`;
-    serverInfo += `Свободно памяти: ${(freeMem / (1024 * 1024 * 1024)).toFixed(2)} ГБ`;
     
     await ctx.reply(serverInfo);
   } catch (error) {
@@ -225,18 +273,31 @@ bot.command("server", async (ctx) => {
 
 bot.start().then(() => {
   console.log('🤖 Бот запущен!');
-  // Выполняем первую проверку при старте
-  setTimeout(() => {
-    checkBestStories(db, bot, config.CHANNEL_ID, config.OPENROUTER_API_KEYS, config.MAX_ITEMS_PER_RUN);
-  }, 5000);
-  
-  setTimeout(() => {
-    checkNewJobs(db, bot, config.JOB_CHANNEL_ID, config.MAX_ITEMS_PER_RUN);
-  }, 15000);
   
   // Запускаем автоматическую проверку
   startNewsChecker();
   startJobChecker();
+  
+  // Выполняем первую проверку при старте с задержкой
+  setTimeout(() => {
+    if (!isNewsChecking) {
+      isNewsChecking = true;
+      checkBestStories(db, bot, config.CHANNEL_ID, config.OPENROUTER_API_KEYS, config.MAX_ITEMS_PER_RUN)
+        .finally(() => {
+          isNewsChecking = false;
+        });
+    }
+  }, 5000);
+  
+  setTimeout(() => {
+    if (!isJobsChecking) {
+      isJobsChecking = true;
+      checkNewJobs(db, bot, config.JOB_CHANNEL_ID, config.MAX_ITEMS_PER_RUN)
+        .finally(() => {
+          isJobsChecking = false;
+        });
+    }
+  }, 15000);
 });
 
 bot.catch((err) => {

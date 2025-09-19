@@ -59,7 +59,7 @@ async function checkNewJobs(db, bot, JOB_CHANNEL_ID, MAX_ITEMS_PER_RUN) {
           // Ограничиваем длину описания, очищаем HTML и переводим
           const cleanDescription = cleanHtml(job.jobDescription);
           const translatedDescription = await translateWithGoogle(cleanDescription);
-          jobDescription = translatedDescription.substring(0, 300);
+          jobDescription = translatedDescription.substring(0,0);
         } else {
           jobDescription = 'Описание отсутствует';
         }
